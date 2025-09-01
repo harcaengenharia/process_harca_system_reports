@@ -5,19 +5,58 @@ import pandas as pd
 import requests
 
 # Para executar localmente, descomente a linha abaixo:
-# from dotenv import load_dotenv
-# load_dotenv()
+from dotenv import load_dotenv
+load_dotenv()
 
 BASE_URL = os.getenv('BASE_URL', 'https://sistema.harcaengenharia.com.br/api')
 CREDENTIALS = {'email': os.getenv('EMAIL'), 'password': os.getenv('PASSWORD')}
 S3_BUCKET = os.getenv('S3_BUCKET', 'sistemaharca')
 S3_FOLDER = os.getenv('S3_FOLDER', 'reports')
 
-s3_client = boto3.client('s3')
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv('ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('SECRET_ACCESS_KEY'),
+    region_name=os.getenv('REGION', 'us-east-2'),
+)
 
 def request_session(endpoint, payload):
     response = requests.post(f'{BASE_URL}{endpoint}', json=payload)
     return response.json() if response.status_code in [200, 201] else None
+
+def request_synthetic_summary(access_token):
+    headers = {'Authorization': f'Bearer {access_token}'}
+    response = requests.post(f'{BASE_URL}/client/report/synthetic-summary', headers=headers)
+    return response.json() if response.status_code in [200, 201] else None
+
+def process_synthetic_summary(data):
+    format_currency = lambda x: f'{float(x):,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+    format_percentage = lambda x: f'{float(x) * 100:.2f}%'.replace('.', ',')
+    df_data = []
+    for row in data:
+        df_data.append({
+            'Nome da Obra': row.get('Nome da Obra', ''),
+            'Cidade': row.get('Cidade', ''),
+            'Estado': row.get('Estado', ''),
+            'Tipo de Obra': row.get('Tipo de Obra', ''),
+            'Número da Última Medição': row.get('Número da Última Medição', ''),
+            'Mês de Referência da Última Medição': row.get('Mês de Referência da Última Medição', ''),
+            'Data da Última Medição': row.get('Data da Última Medição', ''),
+            'Orçamento (R$)': format_currency(row.get('Orçamento (R$)', 0)),
+            'Previsto Acumulado (R$)': format_currency(row.get('Previsto Acumulado (R$)', 0)),
+            'Previsto Acumulado (%)': format_percentage(row.get('Previsto Acumulado (%)', 0)),
+            'Previsto no Período (R$)': format_currency(row.get('Previsto no Período (R$)', 0)),
+            'Previsto no Período (%)': format_percentage(row.get('Previsto no Período (%)', 0)),
+            'Executado Acumulado (R$)': format_currency(row.get('Executado Acumulado (R$)', 0)),
+            'Executado Acumulado (%)': format_percentage(row.get('Executado Acumulado (%)', 0)),
+            'Executado no Período (R$)': format_currency(row.get('Executado no Período (R$)', 0)),
+            'Executado no Período (%)': format_percentage(row.get('Executado no Período (%)', 0)),
+            'Saldo (R$)': format_currency(row.get('Saldo (R$)', 0)),
+            'Saldo (%)': format_percentage(row.get('Saldo (%)', 0)),
+            'Atraso/Adiantamento (R$)': format_currency(row.get('Atraso/Adiantamento (R$)', 0)),
+            'Atraso/Adiantamento (%)': format_percentage(row.get('Atraso/Adiantamento (%)', 0)),
+        })
+    return df_data
 
 def request_report(construction_id, access_token):
     headers = {'Authorization': f'Bearer {access_token}'}
@@ -92,7 +131,7 @@ def process_construction(data):
                 'Estado': state,
                 'Tipo de Obra': construction_type,
                 'Número da Medição': number,
-                'Mês de referência': month,
+                'Mês de Referência': month,
                 'Data da Medição': measurement_date,
                 'Item': s.get('item', ''),
                 'Serviço': s.get('name', ''),
@@ -111,7 +150,7 @@ def process_construction(data):
                 'Saldo (R$)': format_currency(total - measurement_value),
                 'Saldo (%)': format_percentage(1 - measurement_percentage),
                 'Atraso/Adiantamento (R$)': format_currency(measurement_value - schedule_value),
-                'Atraso/Adiantamento (%)': format_percentage(measurement_percentage - schedule_percentage)
+                'Atraso/Adiantamento (%)': format_percentage(measurement_percentage - schedule_percentage),
             }
             df_data.append(row)
 
@@ -139,32 +178,26 @@ def lambda_handler(event, context):
         }
 
 def main():
-    """Função principal para processar os relatórios"""
+    """Função principal para processar relatório sintético"""
     store_data = request_session('/client/sessions', CREDENTIALS)
-
-    all_data = []
     if store_data:
-        for construction in store_data.get('constructions', []):
-            print(f"Processando obra: {construction.get('name', '')}")
-            construction_data = request_report(construction.get('id'), store_data.get('access_token'))
-            if construction_data:
-                all_data.extend(process_construction(construction_data))
-    
-    if all_data:
-        df = pd.DataFrame(all_data)
-        filename = 'data.csv'
-        df.to_csv(f'/tmp/{filename}', index=False, sep=';')
-        s3_path = upload_to_s3(f'/tmp/{filename}', S3_BUCKET, f'{S3_FOLDER}/{filename}')
-        print(f'Arquivo gerado e enviado para S3: {s3_path}')
-        return {
-            'statusCode': 200,
-            'body': f'Relatório gerado com sucesso: {s3_path}'
-        }
-    else:
-        return {
-            'statusCode': 200,
-            'body': 'Nenhum dado encontrado para gerar relatório'
-        }
+        print("Consultando relatório sintético...")
+        synthetic_data = request_synthetic_summary(store_data.get('access_token'))
+        if synthetic_data:
+            df_data = process_synthetic_summary(synthetic_data)
+            df = pd.DataFrame(df_data)
+            filename = 'data.csv'
+            df.to_csv(filename, index=False, sep=';')
+            s3_path = upload_to_s3(filename, S3_BUCKET, f'{S3_FOLDER}/{filename}')
+            print(f'Arquivo gerado e enviado para S3: {s3_path}')
+            return {
+                'statusCode': 200,
+                'body': f'Relatório gerado com sucesso: {s3_path}'
+            }
+    return {
+        'statusCode': 200,
+        'body': 'Nenhum dado encontrado para gerar relatório sintético'
+    }
 
 if __name__ == '__main__':
     # Para execução local, descomente as linhas abaixo:
